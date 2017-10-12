@@ -18,21 +18,31 @@ Texture.prototype.bind = function(n, program, name) {
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     gl.uniform1i(gl.getUniformLocation(program, name), n);
 }
-Texture.prototype.fill = function(width, height, data) {
+Texture.prototype.fill = function(width, height, data, has4Channels) {
     var gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, width, height, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, data);
+    if (has4Channels)
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    else
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, width, height, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, data);
 }
 
 function render(canvas, videoFrame, checkFps) {
     if (checkFps) fpsCount++;
     var gl = canvas.gl;
-    gl.y.fill(videoFrame.width, videoFrame.height,
-        videoFrame.subarray(0, videoFrame.uOffset));
-    gl.u.fill(videoFrame.width >> 1, videoFrame.height >> 1,
-        videoFrame.subarray(videoFrame.uOffset, videoFrame.vOffset));
-    gl.v.fill(videoFrame.width >> 1, videoFrame.height >> 1,
-        videoFrame.subarray(videoFrame.vOffset, videoFrame.length));
+
+    var isBGRA = canvas.vlcPixelFormatIsBGRA;
+    if (isBGRA) {
+        gl.bgra.fill(videoFrame.width, videoFrame.height, videoFrame, isBGRA);
+    }
+    else {
+        gl.y.fill(videoFrame.width, videoFrame.height,
+            videoFrame.subarray(0, videoFrame.uOffset), isBGRA);
+        gl.u.fill(videoFrame.width >> 1, videoFrame.height >> 1,
+            videoFrame.subarray(videoFrame.uOffset, videoFrame.vOffset), isBGRA);
+        gl.v.fill(videoFrame.width >> 1, videoFrame.height >> 1,
+            videoFrame.subarray(videoFrame.vOffset, videoFrame.length), isBGRA);
+    }
 }
 
 var renderFallback = function(canvas, videoFrame) {
@@ -65,9 +75,10 @@ function setupCanvas(canvas, vlc, options) {
         return;
     }
 
-    vlc.pixelFormat = vlc.I420;
-    canvas.I420Program = gl.createProgram();
-    var program = canvas.I420Program;
+    vlc.pixelFormat = options.vlcPixelFormat ? options.vlcPixelFormat : vlc.RV32;
+    canvas.vlcPixelFormatIsBGRA = vlc.pixelFormat === vlc.RV32;
+    canvas.program = gl.createProgram();
+    var program = canvas.program;
     var vertexShaderSource = [
         "attribute highp vec4 aVertexPosition;",
         "attribute vec2 aTextureCoord;",
@@ -80,23 +91,35 @@ function setupCanvas(canvas, vlc, options) {
     var vertexShader = gl.createShader(gl.VERTEX_SHADER);
     gl.shaderSource(vertexShader, vertexShaderSource);
     gl.compileShader(vertexShader);
-    var fragmentShaderSource = [
-        "precision highp float;",
-        "varying lowp vec2 vTextureCoord;",
-        "uniform sampler2D YTexture;",
-        "uniform sampler2D UTexture;",
-        "uniform sampler2D VTexture;",
-        "const mat4 YUV2RGB = mat4",
-        "(",
-        " 1.1643828125, 0, 1.59602734375, -.87078515625,",
-        " 1.1643828125, -.39176171875, -.81296875, .52959375,",
-        " 1.1643828125, 2.017234375, 0, -1.081390625,",
-        " 0, 0, 0, 1",
-        ");",
-        "void main(void) {",
-        " gl_FragColor = vec4( texture2D(YTexture, vTextureCoord).x, texture2D(UTexture, vTextureCoord).x, texture2D(VTexture, vTextureCoord).x, 1) * YUV2RGB;",
-        "}"
-    ].join("\n");
+    if (canvas.vlcPixelFormatIsBGRA) {
+        var fragmentShaderSource = [
+            "precision highp float;",
+            "varying lowp vec2 vTextureCoord;",
+            "uniform sampler2D BGRATexture;",
+            "void main(void) {",
+            " gl_FragColor = vec4(texture2D(BGRATexture, vTextureCoord).bgr, 1);",
+            "}"
+        ].join("\n");
+    }
+    else {
+        var fragmentShaderSource = [
+            "precision highp float;",
+            "varying lowp vec2 vTextureCoord;",
+            "uniform sampler2D YTexture;",
+            "uniform sampler2D UTexture;",
+            "uniform sampler2D VTexture;",
+            "const mat4 YUV2RGB = mat4",
+            "(",
+            " 1.1643828125, 0, 1.59602734375, -.87078515625,",
+            " 1.1643828125, -.39176171875, -.81296875, .52959375,",
+            " 1.1643828125, 2.017234375, 0, -1.081390625,",
+            " 0, 0, 0, 1",
+            ");",
+            "void main(void) {",
+            " gl_FragColor = vec4( texture2D(YTexture, vTextureCoord).x, texture2D(UTexture, vTextureCoord).x, texture2D(VTexture, vTextureCoord).x, 1) * YUV2RGB;",
+            "}"
+        ].join("\n");
+    }
 
     var fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
     gl.shaderSource(fragmentShader, fragmentShaderSource);
@@ -126,12 +149,18 @@ function setupCanvas(canvas, vlc, options) {
         gl.STATIC_DRAW);
     gl.vertexAttribPointer(textureCoordAttribute, 2, gl.FLOAT, false, 0, 0);
 
-    gl.y = new Texture(gl);
-    gl.u = new Texture(gl);
-    gl.v = new Texture(gl);
-    gl.y.bind(0, program, "YTexture");
-    gl.u.bind(1, program, "UTexture");
-    gl.v.bind(2, program, "VTexture");
+    if (canvas.vlcPixelFormatIsBGRA) {
+        gl.bgra = new Texture(gl);
+        gl.bgra.bind(0, program, "BGRATexture");
+    }
+    else {
+        gl.y = new Texture(gl);
+        gl.u = new Texture(gl);
+        gl.v = new Texture(gl);
+        gl.y.bind(0, program, "YTexture");
+        gl.u.bind(1, program, "UTexture");
+        gl.v.bind(2, program, "VTexture");
+    }
 }
 
 function frameSetup(canvas, width, height, pixelFormat) {
@@ -221,9 +250,15 @@ module.exports = {
         arr1[0] = 0;
         arr2[0] = 128;
 
-        gl.y.fill(1, 1, arr1);
-        gl.u.fill(1, 1, arr2);
-        gl.v.fill(1, 1, arr2);
+        var isBGRA = canvas.vlcPixelFormatIsBGRA;
+        if (isBGRA) {
+            gl.bgra.fill(1, 1, arr1, isBGRA);
+        }
+        else {
+            gl.y.fill(1, 1, arr1, isBGRA);
+            gl.u.fill(1, 1, arr2, isBGRA);
+            gl.v.fill(1, 1, arr2, isBGRA);
+        }
 
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
